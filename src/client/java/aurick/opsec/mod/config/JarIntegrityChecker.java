@@ -17,14 +17,12 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Async jar integrity checker that compares the running mod jar's SHA-256 hash
- * against the expected digest computed from the matching GitHub release asset.
- * All state fields are volatile for cross-thread visibility since the check runs
- * on a background thread and results are read on the render thread.
+ * Checks the installed JAR against assets published in this fork's GitHub release.
+ * A mismatch is a warning for investigation, not proof of malware.
  */
 public final class JarIntegrityChecker {
-
-    private static final String RELEASES_BASE_URL = "https://api.github.com/repos/aurickk/OpSec/releases/tags/V";
+    private static final String RELEASES_BASE_URL =
+            "https://api.github.com/repos/jryoung201-code/OpSec-/releases/tags/V";
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
@@ -37,219 +35,154 @@ public final class JarIntegrityChecker {
     private static volatile String expectedDigest = null;
     private static volatile String actualDigest = null;
 
-    private JarIntegrityChecker() {
-        // Utility class
-    }
+    private JarIntegrityChecker() {}
 
-    /**
-     * Fires an async integrity check that computes the local jar's SHA-256 and
-     * compares it against the SHA-256 of the matching GitHub release asset.
-     * Non-blocking: runs on a daemon thread via CompletableFuture.
-     */
     public static void checkIntegrity() {
         CompletableFuture.runAsync(() -> {
             try {
-                // Step 1: Get jar path from FabricLoader
                 Path jarPath = FabricLoader.getInstance()
                         .getModContainer(Opsec.MOD_ID)
                         .flatMap(mod -> mod.getOrigin().getPaths().stream().findFirst())
                         .orElse(null);
 
-                if (jarPath == null || !Files.isRegularFile(jarPath)) {
-                    Opsec.LOGGER.debug("[OpSec] Not running from jar, skipping integrity check");
+                if (jarPath == null || !Files.isRegularFile(jarPath)
+                        || !jarPath.toString().toLowerCase(java.util.Locale.ROOT).endsWith(".jar")) {
+                    Opsec.LOGGER.debug("[OpSec] Not running from a JAR; skipping integrity check");
                     return;
                 }
 
-                if (!jarPath.toString().endsWith(".jar")) {
-                    Opsec.LOGGER.debug("[OpSec] Not running from jar file, skipping integrity check");
-                    return;
+                try (var input = Files.newInputStream(jarPath)) {
+                    MessageDigest localDigest = MessageDigest.getInstance("SHA-256");
+                    byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = input.read(buffer)) != -1) {
+                        localDigest.update(buffer, 0, read);
+                    }
+                    actualDigest = bytesToHex(localDigest.digest());
                 }
 
-                // Step 2: Compute local SHA-256
-                byte[] jarBytes = Files.readAllBytes(jarPath);
-                MessageDigest localDigest = MessageDigest.getInstance("SHA-256");
-                actualDigest = bytesToHex(localDigest.digest(jarBytes));
-
-                // Step 3: Get Minecraft version
-                String mcVersion = FabricLoader.getInstance()
-                        .getModContainer("minecraft")
-                        .map(mod -> mod.getMetadata().getVersion().getFriendlyString())
-                        .orElse(null);
-
-                if (mcVersion == null) {
-                    Opsec.LOGGER.debug("[OpSec] Could not determine Minecraft version, skipping integrity check");
-                    return;
-                }
-
-                // Step 4: Fetch the GitHub release matching the current mod version
                 String currentVersion = Opsec.getVersion();
                 HttpRequest request = HttpRequest.newBuilder()
                         .uri(URI.create(RELEASES_BASE_URL + currentVersion))
-                        .header("User-Agent", "OpSec-Mod/" + currentVersion)
-                        .header("Accept", "application/vnd.github.v3+json")
+                        .header("User-Agent", "OpSec-Fork/" + currentVersion)
+                        .header("Accept", "application/vnd.github+json")
                         .timeout(Duration.ofSeconds(10))
                         .GET()
                         .build();
 
                 HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-
                 if (response.statusCode() == 404) {
-                    // No release for this version — dev/unreleased build
-                    Opsec.LOGGER.debug("[OpSec] No release found for version {}, skipping integrity check", currentVersion);
+                    Opsec.LOGGER.debug("[OpSec] No matching fork release for version {}; skipping integrity check", currentVersion);
                     return;
                 }
-
                 if (response.statusCode() != 200) {
-                    Opsec.LOGGER.debug("[OpSec] GitHub API returned status {}, skipping integrity check", response.statusCode());
+                    Opsec.LOGGER.debug("[OpSec] Fork release API returned {}; skipping integrity check", response.statusCode());
                     return;
                 }
 
                 JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
+                if (!json.has("assets") || !json.get("assets").isJsonArray()) return;
 
-                if (!json.has("assets")) {
-                    Opsec.LOGGER.debug("[OpSec] No assets in release response, skipping integrity check");
+                String mcVersion = FabricLoader.getInstance()
+                        .getModContainer("minecraft")
+                        .map(mod -> mod.getMetadata().getVersion().getFriendlyString())
+                        .orElse(null);
+                if (mcVersion == null) return;
+
+                JsonObject matchingAsset = findMatchingAsset(json.getAsJsonArray("assets"), mcVersion);
+                if (matchingAsset == null || !matchingAsset.has("digest")) {
+                    Opsec.LOGGER.debug("[OpSec] No matching JAR digest in fork release; skipping integrity check");
                     return;
                 }
 
-                JsonArray assets = json.getAsJsonArray("assets");
-                JsonObject matchingAsset = findMatchingAsset(assets, mcVersion);
+                String digestField = matchingAsset.get("digest").getAsString();
+                if (!digestField.startsWith("sha256:")) return;
 
-                if (matchingAsset == null) {
-                    Opsec.LOGGER.debug("[OpSec] No release asset found for MC version {}, skipping integrity check", mcVersion);
-                    return;
-                }
-
-                // Step 5: Extract SHA-256 digest from GitHub API response
-                // GitHub provides "digest": "sha256:abc123..." for each release asset
-                String digestField = matchingAsset.has("digest")
-                        ? matchingAsset.get("digest").getAsString()
-                        : null;
-
-                if (digestField == null || !digestField.startsWith("sha256:")) {
-                    Opsec.LOGGER.debug("[OpSec] No SHA-256 digest for matching asset, skipping integrity check");
-                    return;
-                }
-
-                expectedDigest = digestField.substring("sha256:".length());
-
-                // Step 6: Compare digests (constant-time comparison)
-                if (!MessageDigest.isEqual(expectedDigest.getBytes(), actualDigest.getBytes())) {
-                    tamperDetected = true;
-                    Opsec.LOGGER.warn("[OpSec] JAR INTEGRITY CHECK FAILED - Expected: {}, Actual: {}", expectedDigest, actualDigest);
+                expectedDigest = digestField.substring("sha256:".length()).toLowerCase(java.util.Locale.ROOT);
+                tamperDetected = !MessageDigest.isEqual(
+                        expectedDigest.getBytes(java.nio.charset.StandardCharsets.US_ASCII),
+                        actualDigest.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                if (tamperDetected) {
+                    Opsec.LOGGER.warn("[OpSec] JAR integrity check mismatch. Expected: {}, Actual: {}. A mismatch can result from a modified build and is not by itself proof of malware.",
+                            expectedDigest, actualDigest);
                 } else {
-                    Opsec.LOGGER.debug("[OpSec] Jar integrity verified");
+                    Opsec.LOGGER.info("[OpSec] Installed JAR matches the fork's published release digest");
                 }
             } catch (Exception e) {
-                Opsec.LOGGER.debug("[OpSec] Integrity check failed: {}", e.getMessage());
+                Opsec.LOGGER.debug("[OpSec] Integrity check unavailable: {}", e.toString());
             } finally {
                 checkComplete = true;
             }
         });
     }
 
-    /**
-     * Returns true once the integrity check has finished (regardless of result).
-     */
     public static boolean isCheckComplete() {
         return checkComplete;
     }
 
-    /**
-     * Returns true if tamper was detected, the check is complete, and the
-     * warning screen has not been shown this session.
-     */
     public static boolean isTamperDetected() {
         return checkComplete && tamperDetected && !shownThisSession
                 && !OpsecConfig.getInstance().getSettings().isTamperWarningDismissed();
     }
 
-    /**
-     * Marks the tamper warning as shown for this session.
-     * Prevents the screen from appearing again even if user navigates back.
-     */
     public static void markShown() {
         shownThisSession = true;
     }
 
-    /**
-     * Resets the shown flag. Used by the config screen reset button.
-     */
     public static void resetShown() {
         shownThisSession = false;
     }
 
-    /**
-     * Returns the expected SHA-256 digest from the GitHub release asset, or null if not yet checked.
-     */
     public static String getExpectedDigest() {
         return expectedDigest;
     }
 
-    /**
-     * Returns the actual SHA-256 digest of the running jar, or null if not yet checked.
-     */
     public static String getActualDigest() {
         return actualDigest;
     }
 
-    /**
-     * Finds the release asset whose version range covers the given MC version.
-     * Asset names follow the pattern: opsec-{range}+v{mod_version}.jar
-     * where range is either a single version (e.g., "26.1") or a range (e.g., "1.21.2-1.21.5").
-     */
     private static JsonObject findMatchingAsset(JsonArray assets, String mcVersion) {
         for (JsonElement element : assets) {
+            if (!element.isJsonObject()) continue;
             JsonObject asset = element.getAsJsonObject();
             String name = asset.has("name") ? asset.get("name").getAsString() : "";
             if (!name.startsWith("opsec-") || !name.endsWith(".jar")) continue;
 
-            // Extract version range: between "opsec-" and "+v"
-            int rangeStart = 6; // "opsec-".length()
             int rangeEnd = name.indexOf("+v");
-            if (rangeEnd <= rangeStart) continue;
-
-            String range = name.substring(rangeStart, rangeEnd);
+            if (rangeEnd <= "opsec-".length()) continue;
+            String range = name.substring("opsec-".length(), rangeEnd);
             int dash = range.indexOf('-');
-
-            if (dash == -1) {
-                // Single version: exact match
+            if (dash < 0) {
                 if (range.equals(mcVersion)) return asset;
             } else {
-                // Range: min-max (inclusive)
                 String min = range.substring(0, dash);
                 String max = range.substring(dash + 1);
-                if (compareVersions(mcVersion, min) >= 0 && compareVersions(mcVersion, max) <= 0) {
-                    return asset;
-                }
+                if (compareVersions(mcVersion, min) >= 0 && compareVersions(mcVersion, max) <= 0) return asset;
             }
         }
         return null;
     }
 
-    /**
-     * Compares two dot-separated version strings numerically.
-     * Returns negative if a < b, zero if equal, positive if a > b.
-     */
     private static int compareVersions(String a, String b) {
         String[] aParts = a.split("\\.");
         String[] bParts = b.split("\\.");
         int len = Math.max(aParts.length, bParts.length);
         for (int i = 0; i < len; i++) {
-            int aNum = i < aParts.length ? Integer.parseInt(aParts[i]) : 0;
-            int bNum = i < bParts.length ? Integer.parseInt(bParts[i]) : 0;
+            int aNum = i < aParts.length ? parseVersionPart(aParts[i]) : 0;
+            int bNum = i < bParts.length ? parseVersionPart(bParts[i]) : 0;
             if (aNum != bNum) return Integer.compare(aNum, bNum);
         }
         return 0;
     }
 
-    /**
-     * Converts a byte array to a lowercase hex string.
-     */
+    private static int parseVersionPart(String part) {
+        String digits = part.replaceAll("[^0-9].*$", "");
+        return digits.isEmpty() ? 0 : Integer.parseInt(digits);
+    }
+
     private static String bytesToHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b));
-        }
+        for (byte b : bytes) sb.append(String.format("%02x", b & 0xff));
         return sb.toString();
     }
 }
